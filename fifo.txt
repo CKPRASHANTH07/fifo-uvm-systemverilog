@@ -1,0 +1,736 @@
+#testbench code
+
+
+
+
+`include "uvm_macros.svh"
+
+//`timescale 5ns/5ns
+package my_pkg;
+import uvm_pkg::*; 
+
+/////////////////////////////////////////////////////////////////
+
+class fifo_seq_item extends uvm_sequence_item;
+  
+  `uvm_object_utils(fifo_seq_item)
+  
+  rand bit [15:0]data_in;
+  rand bit rd_wr; // 1 for write 0 for read
+  bit [15:0] data_out;
+  
+  function new(string name = "fifo_seq_item");
+    super.new(name);
+  endfunction
+  
+endclass: fifo_seq_item
+
+/////////////////////////////////////////////////////////////////
+
+class write_seq extends uvm_sequence#(fifo_seq_item);
+  
+  `uvm_object_utils(write_seq)
+  fifo_seq_item tr;
+  
+  function new(string name ="write_seq");
+    super.new(name);
+  endfunction
+  
+  task body();
+      `uvm_do_with(tr,{tr.rd_wr == 1;})
+  endtask
+endclass: write_seq
+
+///////////////////////////////////////////////////////////////////
+
+class read_seq extends uvm_sequence#(fifo_seq_item);
+  
+  `uvm_object_utils(read_seq)
+  fifo_seq_item tr;
+  
+  function new(string name ="read_seq");
+    super.new(name);
+  endfunction
+  
+  task body();
+    `uvm_do_with(tr,{tr.rd_wr == 0;})
+  endtask
+endclass: read_seq
+
+////////////////////////////////////////////////////////////////////
+
+class fifo_sequencer extends uvm_sequencer #(fifo_seq_item);
+
+  `uvm_component_utils(fifo_sequencer)
+     
+   function new(input string name, uvm_component parent=null);
+      super.new(name, parent);
+   endfunction : new
+  
+endclass: fifo_sequencer
+
+///////////////////////////////////////////////////////////////////////
+
+class fifo_driver extends uvm_driver #(fifo_seq_item);
+  
+  `uvm_component_utils(fifo_driver)
+  
+  fifo_seq_item tr;
+  
+  virtual fifo_if vif;
+  
+   function new(string name,uvm_component parent = null);
+      super.new(name,parent);
+   endfunction
+  
+  
+   function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+     if(!uvm_config_db#(virtual fifo_if)::get(this, "", "vif", vif))
+       `uvm_fatal("NO_VIF",{"virtual interface must be set for: ",get_full_name(),".vif"});
+    endfunction: build_phase
+  
+  virtual task run_phase(uvm_phase phase);
+     super.run_phase(phase);
+    vif.data_out <= 'd0;
+    vif.wr_en <= 'd0;
+    vif.rd_en <= 'd0;
+    
+    forever begin
+      fifo_seq_item tr;
+      
+      seq_item_port.get_next_item(tr);
+      
+      case (tr.rd_wr)
+        1: drive_write(tr.data_in);  
+        0: drive_read();
+       endcase
+
+      seq_item_port.item_done();
+    end
+  endtask:run_phase
+  
+  virtual task drive_write(input [15:0] data);
+    @(posedge vif.clk)
+    vif.wr_en <= 'b1;
+    vif.data_in <= data;
+    @(posedge vif.clk)
+    vif.wr_en <= 'b0;
+  endtask: drive_write
+  
+  virtual task drive_read();
+    @(posedge vif.clk)
+    vif.rd_en <= 'b1;
+    @(posedge vif.clk)
+    vif.rd_en <= 'b0;
+  endtask: drive_read
+  
+endclass: fifo_driver
+
+///////////////////////////////////////////////////////////////////
+
+class fifo_monitor extends uvm_monitor;
+  `uvm_component_utils(fifo_monitor)
+  
+    virtual fifo_if vif;
+    fifo_seq_item tr;
+  
+  uvm_analysis_port#(fifo_seq_item) item_collected_port;
+
+  function new(string name, uvm_component parent = null);
+     super.new(name, parent);
+     item_collected_port = new("item_collected_port", this);
+   endfunction: new
+  
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    tr = fifo_seq_item::type_id::create("tr", this);
+    if(!uvm_config_db#(virtual fifo_if)::get(this, "", "vif", vif))
+       `uvm_fatal("NOVIF",{"virtual interface must be set for: ",get_full_name(),".vif"});
+  endfunction: build_phase
+  
+  virtual task run_phase(uvm_phase phase);
+     super.run_phase(phase);
+     forever begin
+       @(posedge vif.clk)
+       if(vif.wr_en)begin  
+         $display("wr_en is high");
+         tr.data_in = vif.data_in;
+         tr.rd_wr = 'b1;
+         item_collected_port.write(tr);
+         `uvm_info("Monitor", $sformatf("rd_wr: %0b data is %0h",tr.rd_wr,tr.data_in), UVM_LOW);
+       end
+       else if(vif.rd_en)begin
+          //@(posedge vif.clk)
+         tr.data_out = vif.data_out;
+         tr.rd_wr = 'b0;
+         item_collected_port.write(tr);
+         `uvm_info("Monitor", $sformatf("rd_wr: %0b data is %0h",tr.rd_wr,tr.data_out), UVM_LOW);
+       end
+        //@(posedge vif.clk)
+     end
+  endtask: run_phase
+endclass: fifo_monitor
+
+///////////////////////////////////////////////////////////////////////////
+
+class fifo_agent extends uvm_agent;
+
+   //Agent will have the sequencer, driver and monitor components for the APB interface
+   fifo_sequencer sequencer;
+   fifo_driver driver;
+   fifo_monitor monitor;
+
+   `uvm_component_utils_begin(fifo_agent)
+      `uvm_field_object(sequencer, UVM_ALL_ON)
+      `uvm_field_object(driver, UVM_ALL_ON)
+      `uvm_field_object(monitor, UVM_ALL_ON)
+   `uvm_component_utils_end
+   
+   function new(string name, uvm_component parent = null);
+      super.new(name, parent);
+   endfunction
+
+   //Build phase of agent - construct sequencer, driver and monitor
+   //get handle to virtual interface from env (parent) config_db
+   //and pass handle down to srq/driver/monitor
+  
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if(get_is_active() == UVM_ACTIVE) begin
+      driver = fifo_driver::type_id::create("driver", this);
+      sequencer = fifo_sequencer::type_id::create("sequencer", this);
+    end
+ 
+    monitor = fifo_monitor::type_id::create("monitor", this);
+  endfunction : build_phase
+ 
+  // connect_phase
+  function void connect_phase(uvm_phase phase);
+    if(get_is_active() == UVM_ACTIVE) begin
+      driver.seq_item_port.connect(sequencer.seq_item_export);
+    end
+  endfunction : connect_phase
+endclass: fifo_agent
+
+////////////////////////////////////////////////////////////////
+
+
+ `uvm_analysis_imp_decl(_data)
+class fifo_scoreboard extends uvm_scoreboard;
+
+  `uvm_component_utils(fifo_scoreboard)
+  
+  uvm_analysis_imp_data#(fifo_seq_item, fifo_scoreboard) mon_export;
+             
+  function new(string name,uvm_component parent);
+    super.new(name,parent);
+     mon_export = new("mon_export", this);
+  endfunction  
+               
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+  endfunction
+  
+  int queue[$];
+  
+  function void write_data(input fifo_seq_item tr);
+    bit [15:0] expdata;
+    `uvm_info("write_method", $sformatf("rd_wr: %0b data: %0h",tr.rd_wr,tr.data_in), UVM_LOW);
+   
+    if(tr.rd_wr == 'b1)begin
+    queue.push_back(tr.data_in);
+    end
+    else if(tr.rd_wr == 'b0)begin
+      if(queue.size() >= 'd1)begin
+        expdata = queue.pop_front();
+        
+        `uvm_info("cheker", $sformatf("expdata: %0h data_out: %0h", expdata,tr.data_out), UVM_LOW);
+        if(expdata == tr.data_out)begin
+           $display("PPPPPPP    AA     SSSSSSS   SSSSSSS\nPP   PP  AA  AA   SS        SS\nPPPPPP  AAAAAAAA  SSSSSSS   SSSSSSS\nPP      AA    AA       SS        SS\nPP      AA    AA  SSSSSSS   SSSSSSS");
+        end
+        else begin
+          $display("FFFFFFF    AA     IIIIIIII   LL\nFF       AA  AA      II      LL\nFFFFF   AAAAAAAA     II      LL\nFF      AA    AA     II      LL\nFF      AA    AA  IIIIIIII   LLLLLLL");
+        end
+      end
+        else begin
+          $display("performed read operation when fifo is empty");
+        end
+      end
+  endfunction
+      
+endclass: fifo_scoreboard
+       /////////////////////////////////////////////////////////////////////////////////
+      
+class fifo_env  extends uvm_env;
+  virtual fifo_if  vif;
+     `uvm_component_utils(fifo_env)
+     fifo_agent agent;
+     fifo_scoreboard scoreboard;
+   //ENV class will have agent as its sub component
+   //virtual interface for APB interface
+   function new(string name, uvm_component parent = null);
+      super.new(name, parent);
+   endfunction
+
+   //Build phase - Construct agent and get virtual interface handle from test  and pass it down to agent
+   function void build_phase(uvm_phase phase);
+     agent = fifo_agent::type_id::create("agent", this);
+    scoreboard =fifo_scoreboard::type_id::create("scoreboard",this);    
+     if (!uvm_config_db#(virtual fifo_if)::get(this, "", "vif", vif)) begin
+       `uvm_fatal("FIFO/AGT/NOVIF", "No virtual interface specified for this env instance")
+     end
+     uvm_config_db#(virtual fifo_if)::set( this, "agent", "vif", vif);
+   endfunction: build_phase
+  
+   
+  function void connect_phase(uvm_phase phase);  
+    agent.monitor.item_collected_port.connect(scoreboard.mon_export);
+  endfunction
+endclass: fifo_env
+ 
+////////////////////////////////////////////////////////////////////////////////////
+      
+class fifo_base_test#(parameter  w_trans =10, r_trans =10) extends uvm_test;
+        
+  `uvm_component_utils(fifo_base_test)
+  
+  write_seq w_seq[];
+  read_seq r_seq[];
+  virtual fifo_if vif;
+
+  fifo_env env;
+ // parameter w_trans =10;
+ // parameter r_trans =10;
+  
+  function new(string name = "fifo_base_test", uvm_component parent = null);
+    super.new(name, parent);
+    w_seq = new[w_trans];
+    r_seq = new[r_trans];
+  endfunction
+  
+  function void build_phase(uvm_phase phase);
+   
+    env = fifo_env::type_id::create("env", this);
+    
+    if (!uvm_config_db#(virtual fifo_if)::get(this, "", "vif", vif)) begin
+      `uvm_fatal("FIFO/DRV/NOVIF", "No virtual interface specified for this test instance")
+    end 
+    uvm_config_db#(virtual fifo_if)::set( this, "env", "vif", vif);
+  endfunction
+
+  //Run phase - Create an abp_sequence and start it on the apb_sequencer
+  task run_phase( uvm_phase phase );
+    for(int i=0;i<w_trans;i++)begin
+      w_seq[i] = write_seq::type_id::create("w_seq[i]");
+    end
+ 
+    for(int i=0;i<r_trans;i++)begin
+      r_seq[i] = read_seq::type_id::create("r_seq[i]");
+    end
+   
+    phase.raise_objection( this, "Starting fifo_write_seq in main phase" );
+    $display("%t Starting sequence w_seq run_phase",$time);
+   begin
+     #10;
+    for(int i=0;i<w_trans;i++)begin
+      w_seq[i].start(env.agent.sequencer);
+      
+    end
+    for(int i=0;i<r_trans;i++)begin
+       r_seq[i].start(env.agent.sequencer);
+    end
+   end
+      
+    #100ns;
+    phase.drop_objection( this , "Finished fifo_seq in main phase" );
+    $display("%t ending sequence fifo_seq run_phase",$time);
+  endtask: run_phase
+  
+endclass: fifo_base_test
+
+/////////////////////////////////////////////////
+
+
+class read_write#(parameter  write =10, read =10) extends uvm_test;
+        
+  `uvm_component_utils(read_write)
+  
+  write_seq w_seq[];
+  read_seq r_seq[];
+  virtual fifo_if vif;
+
+  fifo_env env;
+  
+  function new(string name = "fifo_read_write_test", uvm_component parent = null);
+    super.new(name, parent);
+    w_seq = new[write];
+    r_seq = new[read];
+  endfunction
+  
+  function void build_phase(uvm_phase phase);
+   
+    env = fifo_env::type_id::create("env", this);
+    
+    if (!uvm_config_db#(virtual fifo_if)::get(this, "", "vif", vif)) begin
+      `uvm_fatal("FIFO/DRV/NOVIF", "No virtual interface specified for this test instance")
+    end 
+    uvm_config_db#(virtual fifo_if)::set( this, "env", "vif", vif);
+  endfunction
+
+  //Run phase - Create an abp_sequence and start it on the apb_sequencer
+  task run_phase( uvm_phase phase );
+    for(int i=0;i<write;i++)begin
+      w_seq[i] = write_seq::type_id::create("w_seq[i]");
+    end
+ 
+    for(int i=0;i<read;i++)begin
+      r_seq[i] = read_seq::type_id::create("r_seq[i]");
+    end
+   
+    phase.raise_objection( this, "Starting fifo_write_seq in main phase" );
+    $display("%t Starting sequence w_seq run_phase",$time);
+   fork
+    // #10;
+     begin
+    for(int i=0;i<write;i++)begin
+      w_seq[i].start(env.agent.sequencer);
+      
+    end
+     end
+    // #10;
+     begin
+    for(int i=0;i<read;i++)begin
+       r_seq[i].start(env.agent.sequencer);
+    end
+     end
+   join
+      
+    #100ns;
+    phase.drop_objection( this , "Finished fifo_seq in main phase" );
+    $display("%t ending sequence fifo_seq run_phase",$time);
+  endtask: run_phase
+  
+endclass: read_write
+
+/////////////////////////////////////////////////////
+
+class fifo_test2 extends read_write#(32,32);
+  
+  `uvm_component_utils(fifo_test2)
+  
+  function new(string name = "fifo_test2", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+endclass: fifo_test2
+
+
+ //////////////////////////////////////////////////
+
+class fifo_test extends fifo_base_test#(32,32);
+  
+    `uvm_component_utils(fifo_test)
+  
+  function new(string name = "fifo_test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+endclass: fifo_test
+      
+endpackage
+      
+////////////////////////////////////////////////////////////////////////////////////////
+      
+module top;
+
+  
+  import uvm_pkg::*;
+  import my_pkg::*;
+ 
+ bit clk;
+ bit reset;
+  fifo_if  fifo_if();
+  
+  
+  fifo  dut(.clk(fifo_if.clk),
+            .reset_n(fifo_if.reset_n),
+            .wr_en(fifo_if.wr_en),
+            .rd_en(fifo_if.rd_en),
+            .data_in(fifo_if.data_in),
+            .data_out(fifo_if.data_out)
+             );
+ 
+  
+  assign fifo_if.clk = clk;
+  assign fifo_if.reset_n = reset;
+  
+  initial begin 
+      
+    //Pass this physical interface to test top (which will further pass it down to env->agent->drv/sqr/mon
+    uvm_config_db#(virtual fifo_if)::set(null,"*", "vif", fifo_if);
+    
+    `uvm_info("top","uvm_config_db set for uvm_test_top",UVM_LOW);
+    //Call the test - but passing run_test argument as test class name
+    //Another option is to not pass any test argument and use +UVM_TEST on command line to sepecify which test to run
+   
+    //run_test("fifo_test");
+    //run_test("fifo_test2");
+
+    //run_test("fifo_base_test");
+   run_test("read_write");
+  end
+  
+  initial begin
+    $dumpfile("dump.vcd");
+    $dumpvars(0, top);
+    
+  end
+  initial begin
+    forever begin
+      #(50) clk = ~clk;
+    end
+  end
+  
+  initial begin
+    reset =1'b0;
+    #10 reset =1'b1;
+  end
+endmodule
+
+
+#design code
+
+interface fifo_if;  
+  logic clk;
+  logic wr_en;
+  logic rd_en;
+  logic reset_n;
+  logic [15:0] data_in;
+  logic [15:0] data_out;
+
+   //Master Clocking block - used for Drivers
+   clocking driver_cb @(posedge clk);
+    // default input #1ps output #2;
+      output wr_en,rd_en,data_in;
+      input  data_out;
+   endclocking: driver_cb
+  
+   //Monitor Clocking block - For sampling by monitor components
+   clocking monitor_cb @(posedge clk);
+    // default input #1ps output #2;
+      input wr_en,rd_en,data_in,data_out;
+   endclocking: monitor_cb
+  
+  modport driver(clocking driver_cb);
+  modport monitor(clocking monitor_cb);
+
+endinterface: fifo_if
+   //////////////////
+    
+/*module fifo(clk,reset_n,wr_en,rd_en,data_in,data_out);
+  input clk,wr_en,rd_en,reset_n;
+  input [15:0] data_in;
+  output reg [15:0] data_out;
+  
+  reg [15:0]fifo_mem[32];
+  reg [5:0] w_ptr,r_ptr;
+  reg fifo_full,fifo_empty;
+  
+  always@(posedge clk)begin
+    if(!reset_n)begin
+      for(int i=0; i<32;i++)begin
+        fifo_mem[i] = 'd0;
+      end
+      fifo_full = 'b0;
+      fifo_empty = 'b1;
+      w_ptr = 'd0;
+      r_ptr = 'd0;
+      data_out ='d0;
+    end
+  end
+    ////write logic////
+    
+  always@(posedge clk)begin
+    if(wr_en && !fifo_full)begin
+ //     $display("wr_en is high");
+      fifo_mem[w_ptr[4:0]] = data_in;
+      w_ptr = w_ptr +'d1;
+    end  
+  end
+    
+    ////////// read logic///////
+  always@(posedge clk && rd_en)begin
+    if(rd_en && !fifo_empty)begin
+      data_out = fifo_mem[r_ptr[4:0]];
+      r_ptr = r_ptr+1;
+    end
+   // else data_out<= 'd0;
+  end
+  
+  always@(posedge clk)begin
+    if(w_ptr == r_ptr)begin
+      fifo_empty = 'b1;
+    end
+    else begin
+      fifo_empty = 'b0;
+    end
+  end
+  
+  always@(posedge clk)begin
+      
+    if(w_ptr[4:0] == r_ptr[4:0] && w_ptr[5] =='b1)begin
+        fifo_full ='b1;                                   
+    end
+  else begin
+    fifo_full ='b0;
+  end
+  end
+ endmodule*/
+    
+    
+module fifo(clk,reset_n,wr_en,rd_en,data_in,data_out);
+
+  input [15:0] data_in;
+  input clk, reset_n, rd_en, wr_en; 
+  output reg [15:0] data_out;
+
+  reg [15:0] fifo_ram[32];
+  reg [4:0] rd_ptr, wr_ptr;
+  reg [5:0]fifo_cnt;
+
+  assign empty = (fifo_cnt==0);
+  assign full = (fifo_cnt==32);
+
+always @( posedge clk ) 
+begin: write
+if(wr_en && !full) fifo_ram[wr_ptr] <= data_in;
+else if(wr_en && rd_en) fifo_ram[wr_ptr] <= data_in;
+end
+
+  always @( posedge clk && rd_en) 
+begin: read
+if(rd_en && !empty)
+  data_out <= fifo_ram[rd_ptr];
+else if(rd_en && wr_en && empty) 
+  data_out <= fifo_ram[rd_ptr];
+end
+
+always @( posedge clk ) 
+begin: pointer
+  if( !reset_n ) 
+  begin 
+    wr_ptr <= 0; 
+    rd_ptr <= 0;
+  end 
+  else 
+  begin
+    wr_ptr <= ((wr_en && !full)||(wr_en && rd_en)) ? wr_ptr+1 : wr_ptr;
+    rd_ptr <= ((rd_en && !empty)||(wr_en && rd_en)) ? rd_ptr+1 : rd_ptr;
+  end 
+end
+
+always @( posedge clk ) 
+begin: count 
+  if( !reset_n ) 
+    fifo_cnt <= 0;
+  else 
+  begin
+    case ({wr_en,rd_en})
+      2'b00 : fifo_cnt <= fifo_cnt;
+      2'b01 : fifo_cnt <= (fifo_cnt==0) ? 0 : fifo_cnt-1; 
+      2'b10 : fifo_cnt <= (fifo_cnt==32) ? 32 : fifo_cnt+1; 
+      2'b11 : fifo_cnt <= fifo_cnt;
+      default: fifo_cnt <= fifo_cnt;
+    endcase 
+  end
+end
+
+
+endmodule  
+   
+//module sync_fifo(data_out,full,empty,data_in,clk,rst_a,wr_en,rd_en);
+ /*module fifo(clk,reset_n,wr_en,rd_en,data_in,data_out);
+
+//---------------parametre declaration
+   parameter data_width    = 4;
+   parameter address_width = 4;
+   parameter ram_depth     =16;
+
+
+
+//--------------input output port declaration
+   output [data_width-1:0] data_out;
+   //output      full;
+  // output      empty;
+   input [data_width-1:0]  data_in;
+   input      clk;
+   input      reset_n;
+   input      wr_en;
+   input      rd_en;
+
+//--------------internal register declaration
+   reg [address_width-1:0]    wr_pointer;
+   reg [address_width-1:0]    rd_pointer;
+   reg [address_width :0]     status_count;
+   reg [data_width-1:0]       data_out ;
+   wire [data_width-1:0]      data_ram ;
+   reg full;
+   reg empty;
+
+
+ 
+//--------------wr_pointer pointing to write address
+   always @ (posedge clk)
+     begin
+ if(!reset_n)
+   wr_pointer = 0;
+ else
+   if(wr_en)
+     wr_pointer = wr_pointer+1;
+     end
+//-------------rd_pointer points to read address
+   always @ (posedge clk)
+     begin
+ if(!reset_n)
+   rd_pointer = 0;
+ else
+   if(rd_en)
+     rd_pointer = rd_pointer+1;
+     end
+//-------------read from FIFO
+   always @ (posedge clk)
+     begin
+ if(!reset_n)
+   data_out=0;
+ else
+   if(rd_en)
+     data_out=data_ram;
+     end
+
+//--------------Status pointer for full and empty checking
+   always @ (posedge clk)
+     begin
+ if(!reset_n)
+   status_count = 0;
+ else
+   if(wr_en && !rd_en && (status_count != ram_depth))
+     status_count = status_count + 1;
+   else
+     if(rd_en && !wr_en && (status_count != 0))
+       status_count = status_count - 1;
+     end // always @ (posedge clk,posedge rst_a)
+
+
+   assign full = (status_count == (ram_depth));
+   assign empty = (status_count == 0);
+ 
+  // memory_16x4 #(data_width,address_width,ram_depth) u1 (.address_1(wr_pointer),.address_2(rd_pointer),.data_1(data_in),.data_2(data_ram),.wr_en1(wr_en),.rd_en2(rd_en),.clk(clk));
+
+endmodule // sync_fifo*/
+
+
+                                           
+    
+  
+  
